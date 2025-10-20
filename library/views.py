@@ -4,14 +4,17 @@ from .models import Author, Book, Member, Loan
 from .serializers import AuthorSerializer, BookSerializer, MemberSerializer, LoanSerializer
 from rest_framework.decorators import action
 from django.utils import timezone
-from .tasks import send_loan_notification
+from django.db.models import Count, Q
+from .tasks import send_loan_notification, check_overdue_loans
+
+from datetime import timedelta
 
 class AuthorViewSet(viewsets.ModelViewSet):
     queryset = Author.objects.all()
     serializer_class = AuthorSerializer
 
 class BookViewSet(viewsets.ModelViewSet):
-    queryset = Book.objects.all()
+    queryset = Book.objects.select_related('author').all()
     serializer_class = BookSerializer
 
     @action(detail=True, methods=['post'])
@@ -24,7 +27,7 @@ class BookViewSet(viewsets.ModelViewSet):
             member = Member.objects.get(id=member_id)
         except Member.DoesNotExist:
             return Response({'error': 'Member does not exist.'}, status=status.HTTP_400_BAD_REQUEST)
-        loan = Loan.objects.create(book=book, member=member)
+        loan = Loan.objects.create(book=book, member=member, due_date=timezone.now().date() + timedelta(days=14))
         book.available_copies -= 1
         book.save()
         send_loan_notification.delay(loan.id)
@@ -49,6 +52,31 @@ class MemberViewSet(viewsets.ModelViewSet):
     queryset = Member.objects.all()
     serializer_class = MemberSerializer
 
+    @action(detail=False, methods=["get"])
+    def top_active(self, request):
+        top_members = Member.objects.annotate(
+            active_loans=Count("loans", filter=Q(loans__is_returned=False))
+        ).order_by('-active_loans')[:5]
+        data = [{
+            "id": member.id,
+            "username": member.user.username,
+            "email": member.user.email,
+            "active_loans": member.active_loans
+        } for member in top_members]
+        return Response(data)
+
 class LoanViewSet(viewsets.ModelViewSet):
     queryset = Loan.objects.all()
     serializer_class = LoanSerializer
+
+    @action(detail=True, methods=['post'])
+    def extend_due_date(self, request, pk=None):
+        loan = self.get_object()
+        if loan.is_returned:
+            return Response({'error': 'Book has already been returned'})
+        additional_days = int(request.data.get("additional_days"), 7)
+        if loan.due_date:
+            loan.due_date += timedelta(days=additional_days)
+            loan.save()
+            return Response({'status': f'Loan due date  has been successfully extended'})
+        return Response({'error': 'Due dae missing for this loan'})
